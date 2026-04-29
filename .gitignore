@@ -4,3 +4,7 @@ __pycache__/
 .env
 *.log
 test_log.txt
+
+judge_results.txt
+test_log.txt
+*.txt

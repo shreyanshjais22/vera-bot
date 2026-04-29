@@ -205,7 +205,7 @@ async def homepage():
     await fetch(BOT+'/v1/context', {{method:'POST',headers:{{'Content-Type':'application/json'}},
       body: JSON.stringify({{scope:'merchant',context_id:'demo_merchant',version:99,delivered_at:new Date().toISOString(),
         payload:{{merchant_id:'demo_merchant',category_slug:'restaurants',
-          identity:{{name:'Demo Restaurant',city:'Delhi',locality:'Connaught Place',owner_first_name:'Raj',languages:['en','hi']}},
+          identity:{{name:'Demo Merchant',city:'Delhi',locality:'Connaught Place',owner_first_name:'Shreyansh',languages:['en','hi']}},
           subscription:{{status:'active',plan:'Pro',days_remaining:45}},
           performance:{{views:3200,calls:18,ctr:0.019,delta_7d:{{calls_pct:-0.25}}}},
           offers:[{{id:'o1',title:'Weekday Lunch Thali @ ₹149',status:'active'}}],
@@ -265,10 +265,11 @@ async def metadata():
         "model": "gemini-2.0-flash",
         "approach": (
             "Trigger-routed LLM composer using Gemini 2.0 Flash. "
-            "4-context prompt with trigger-kind hints, voice matching, and post-LLM validation. "
-            "Rule-based fast paths for auto-reply detection, opt-out, intent transitions, and out-of-scope."
+            "4-context architecture (Category, Merchant, Trigger, Customer). "
+            "All 25 trigger kinds handled with data-grounded, specific messages. "
+            "Rule-based fast paths for auto-reply, opt-out, and intent transitions."
         ),
-        "contact_email": os.getenv("CONTACT_EMAIL", ""),
+        "contact_email": os.getenv("CONTACT_EMAIL", "shreyanshjaiswal2002@gmail.com"),
         "version": "1.0.0",
         "submitted_at": "2026-04-29T14:00:00Z",
     }
