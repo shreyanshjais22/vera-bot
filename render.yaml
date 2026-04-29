@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: vera-bot
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: TEAM_NAME
+        value: VeraBot
+      - key: TEAM_MEMBER
+        value: Shreyansh
