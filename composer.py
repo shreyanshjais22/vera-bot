@@ -240,11 +240,14 @@ def _fallback_compose(
     if kind == "research_digest":
         items = category.get("digest", [])
         item = next((d for d in items if d.get("id") == payload.get("top_item_id")), items[0] if items else {})
-        title = item.get("title", "new findings")
         source = item.get("source", "journal")
         n = item.get("trial_n", "")
-        n_str = f" (n={n})" if n else ""
-        body = f"{name}, {source} dropped{n_str}. Key: {title}. Want me to draft a patient note from it?"
+        n_str = f" (n={n:,})" if n else ""
+        title = item.get("title", "new findings")
+        # Pull cohort size for specificity
+        high_risk = merchant.get("customer_aggregate", {}).get("high_risk_adult_count", 0)
+        cohort_str = f" {high_risk} of your patients qualify." if high_risk else ""
+        body = f"{name}, {source} dropped{n_str}. Key: {title}.{cohort_str} Draft a patient note? Reply YES."
 
     elif kind == "regulation_change":
         deadline = payload.get("deadline_iso", "Dec 2026")[:10]
@@ -254,18 +257,30 @@ def _fallback_compose(
         slots = payload.get("available_slots", [])
         slot_str = " or ".join(s["label"] for s in slots[:2]) if slots else "this week"
         service = payload.get("service_due", "check-up").replace("_", " ")
+        lapsed = merchant.get("customer_aggregate", {}).get("lapsed_180d_plus", 0)
         if cust_name:
-            body = f"Hi {cust_name}! {name}'s clinic — your {service} is due. Slots open: {slot_str}. Reply 1 or 2 to book."
+            # Gold standard: patient name + specific service + slot options
+            body = f"Hi {cust_name}! {name}'s clinic — your {service} is due. Open slots: {slot_str}. Reply 1 or 2 to confirm."
         else:
-            body = f"{name}, patient recall due for {service}. Slots: {slot_str}. Want me to send reminders?"
+            # Bulk recall: use lapsed count as proof
+            count_str = f"{lapsed} patients" if lapsed else "patients"
+            body = f"{name}, {count_str} haven't visited in 6+ months. Should I send them a recall for {service} with your {offer_title or 'active offer'}?"
 
     elif kind == "perf_dip":
         delta = int(abs(payload.get("delta_pct", 0.2)) * 100)
         metric = payload.get("metric", "calls")
-        baseline = payload.get("vs_baseline", "")
-        base_str = f" vs {baseline} normally" if baseline else ""
-        fix = f"Push your {offer_title}" if offer_title else "Add an offer"
-        body = f"{name}, {metric} down {delta}% this week{base_str}. {fix} to recover. Want me to draft the push?"
+        # Gold standard: X people searching + real offer + yes/no
+        trend_signals = category.get("trend_signals", [])
+        locality = merchant.get("identity", {}).get("locality", "your area")
+        if trend_signals:
+            q = trend_signals[0].get("query", "your service")
+            delta_yoy = int(trend_signals[0].get("delta_yoy", 0) * 100)
+            body = f"{name}, {metric} down {delta}% but search for '{q}' is up {delta_yoy}% in {locality}. {f'Your {offer_title} is the right hook.' if offer_title else 'Add an offer to capture them.'} Should I run a push now?"
+        else:
+            fix = f"Your {offer_title} is the right hook." if offer_title else "Add an active offer."
+            peer_calls = int(category.get("peer_stats", {}).get("avg_calls_30d", 0))
+            peer_str = f" Peer avg: {peer_calls} calls." if peer_calls else ""
+            body = f"{name}, {metric} dropped {delta}% this week.{peer_str} {fix} Should I push it now?"
 
     elif kind == "perf_spike":
         delta = int(abs(payload.get("delta_pct", 0.15)) * 100)
