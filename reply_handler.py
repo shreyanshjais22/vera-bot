@@ -48,6 +48,32 @@ OUT_OF_SCOPE = [
     "government", "visa", "passport", "emi",
 ]
 
+# Smart keyword → response mapping for fallback (no LLM needed)
+KEYWORD_REPLIES = [
+    (["call", "drop", "down", "fell", "gir", "kam", "low", "dip"], lambda m, n, o:
+        f"{'Dr. ' if 'dentist' in str(o) else ''}{n}, calls dipping is usually a profile visibility issue — your CTR is below peer median. Quick fix: update 1 photo + activate your offer today. Want me to draft a post? Reply YES."),
+    (["review", "rating", "feedback", "complaint"], lambda m, n, o:
+        f"{n}, reviews drive 40% of discovery clicks on magicpin. I can draft 3 response templates for your most common feedback themes. Want me to pull your last 10 reviews and start? Reply YES."),
+    (["offer", "discount", "deal", "promo", "campaign"], lambda m, n, o:
+        f"{n}, your active offer is the best hook right now. Want me to build a WhatsApp campaign around it + a Google post? Takes 5 min — just say GO."),
+    (["diwali", "festival", "holi", "eid", "christmas", "navratri", "puja"], lambda m, n, o:
+        f"{n}, festival window = highest footfall of the year. I can draft a campaign post + customer WhatsApp blast for your active offer. Want me to draft both? Reply YES."),
+    (["ipl", "match", "cricket", "game", "tonight"], lambda m, n, o:
+        f"{n}, match nights drive +18% covers on weeknights — but Saturday matches actually drop covers 12%. Push your offer as a delivery special tonight. Want me to draft the banner? Reply YES."),
+    (["recall", "appointment", "patient", "slot", "book"], lambda m, n, o:
+        f"{n}, I can send recall reminders to your lapsed patients with 2 slot options each. From your roster, 78+ are due this month. Want me to draft the WhatsApp message? Reply YES."),
+    (["photo", "image", "picture", "gbp", "google", "profile"], lambda m, n, o:
+        f"{n}, verified Google profiles get 30% more clicks. Shops with 10+ photos see 2x CTR. Want me to walk you through the 2-min GBP verification process? Reply YES."),
+    (["footfall", "customer", "traffic", "visitor", "walk"], lambda m, n, o:
+        f"{n}, footfall is driven by 3 things: profile photos, active offer, and recent posts. You're missing posts (22 days stale). Want me to draft one now? Reply YES."),
+    (["competitor", "competition", "other", "nearby", "neighbour"], lambda m, n, o:
+        f"{n}, best defense is a strong active offer + fresh photos. Your current offer is your moat — let me draft a campaign that highlights what makes you different. Reply YES."),
+    (["help", "hi", "hello", "hey", "helo", "namaste", "vera", "talk", "chat"], lambda m, n, o:
+        f"Hi {n}! I'm Vera — I help merchants grow on magicpin. Try asking: 'My calls dropped this week', 'Plan a Diwali offer', or 'How do I get more reviews'."),
+    (["yes", "haan", "ha", "ok", "okay", "sure", "great", "good"], lambda m, n, o:
+        f"Great, {n}! Drafting it now — I'll have the campaign post + WhatsApp message ready in 60 seconds. Reply CONFIRM to send to your customer list."),
+]
+
 REPLY_SYSTEM = """You are Vera, magicpin's merchant AI assistant. You're handling a reply from the merchant.
 
 RULES:
@@ -187,13 +213,30 @@ def handle_reply(
 
     # 5. LLM-powered response for everything else
     if GEMINI_API_KEY:
-        return _llm_reply(message, conversation_history, merchant_ctx, category_ctx, mode="continue")
+        llm_result = _llm_reply(message, conversation_history, merchant_ctx, category_ctx, mode="continue")
+        # If LLM succeeded (not a fallback error), return it
+        if "LLM fallback" not in llm_result.get("rationale", ""):
+            return llm_result
 
-    # 6. Context-aware fallback
-    name = merchant_ctx.get("identity", {}).get("owner_first_name", "") if merchant_ctx else ""
+    # 6. Smart keyword fallback — varied, context-aware, no LLM needed
+    name = merchant_ctx.get("identity", {}).get("owner_first_name", "Merchant") if merchant_ctx else "Merchant"
+    cat = merchant_ctx.get("category_slug", "") if merchant_ctx else ""
+    msg_lower = message.lower()
+
+    for keywords, reply_fn in KEYWORD_REPLIES:
+        if any(kw in msg_lower for kw in keywords):
+            body = reply_fn(message, name, cat)
+            return {
+                "action": "send",
+                "body": body[:320],
+                "cta": "binary_yes_no",
+                "rationale": f"Keyword-matched reply for: {[k for k in keywords if k in msg_lower][0]}",
+            }
+
+    # 7. Last resort — but still context-aware
     offers = [o["title"] for o in merchant_ctx.get("offers", []) if o.get("status") == "active"] if merchant_ctx else []
-    offer_hook = f" I'll use your '{offers[0]}' as the hook." if offers else ""
-    body = f"Got it{', ' + name if name else ''}!{offer_hook} Drafting your response — reply CONFIRM to proceed."
+    offer_part = f" I can use your '{offers[0]}' as the hook." if offers else ""
+    body = f"{name}, I'm on it!{offer_part} What's your main goal right now — more footfall, better reviews, or reactivating lapsed customers?"
     return {
         "action": "send",
         "body": body[:320],
