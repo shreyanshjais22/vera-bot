@@ -192,25 +192,74 @@ async def homepage():
 
 <script>
   const BOT = window.location.origin;
-  let convId = 'demo_' + Date.now();
-  let merchantLoaded = false;
+  let convId = 'demo_meera_' + Date.now();
+  // Real merchant from dataset: m_001_drmeera_dentist_delhi
+  const MERCHANT_ID = 'm_001_drmeera_dentist_delhi';
 
   async function loadDemo() {{
-    // Push minimal demo context
+    // REAL category context from dataset/categories/dentists.json
     await fetch(BOT+'/v1/context', {{method:'POST',headers:{{'Content-Type':'application/json'}},
-      body: JSON.stringify({{scope:'category',context_id:'restaurants',version:99,delivered_at:new Date().toISOString(),
-        payload:{{slug:'restaurants',voice:{{tone:'warm_busy_practical'}},
-          offer_catalog:[{{id:'demo_001',title:'Weekday Lunch Thali @ ₹149',value:'149',status:'active'}}],
-          peer_stats:{{avg_calls_30d:38,avg_ctr:0.025}},digest:[],seasonal_beats:[]}}}})}})
+      body: JSON.stringify({{
+        scope:'category', context_id:'dentists', version:1,
+        delivered_at: new Date().toISOString(),
+        payload:{{
+          slug:'dentists',
+          voice:{{tone:'peer_clinical', register:'doctor_to_doctor', vocab_taboo:['guaranteed','cure','permanent fix']}},
+          offer_catalog:[
+            {{id:'den_001',title:'Dental Cleaning @ \u20b9299',value:'299',anchor:'MRP \u20b9699'}},
+            {{id:'den_002',title:'Root Canal (Single Sitting) @ \u20b92499',value:'2499'}},
+            {{id:'den_003',title:'Clear Aligner Consult (Free)',value:'0'}}
+          ],
+          peer_stats:{{avg_rating:4.4, avg_calls_30d:12, avg_ctr:0.030, retention_6mo_pct:0.52}},
+          digest:[{{
+            id:'d_2026W17_jida_fluoride', kind:'research',
+            title:'3-month fluoride recall cuts caries 38% better than 6-month',
+            source:'JIDA Oct 2026, p.14', trial_n:2100, patient_segment:'high_risk_adults'
+          }}],
+          seasonal_beats:[
+            {{month_range:'Nov-Feb', note:'exam-stress bruxism spike — night guards'}},
+            {{month_range:'Mar-May', note:'wedding season aligners surge'}}
+          ],
+          trend_signals:[{{query:'clear aligners delhi', delta_yoy:0.62}}]
+        }}
+      }})
+    }})
+    // REAL merchant context from dataset/merchants_seed.json — m_001_drmeera_dentist_delhi
     await fetch(BOT+'/v1/context', {{method:'POST',headers:{{'Content-Type':'application/json'}},
-      body: JSON.stringify({{scope:'merchant',context_id:'demo_merchant',version:99,delivered_at:new Date().toISOString(),
-        payload:{{merchant_id:'demo_merchant',category_slug:'restaurants',
-          identity:{{name:'Demo Merchant',city:'Delhi',locality:'Connaught Place',owner_first_name:'Shreyansh',languages:['en','hi']}},
-          subscription:{{status:'active',plan:'Pro',days_remaining:45}},
-          performance:{{views:3200,calls:18,ctr:0.019,delta_7d:{{calls_pct:-0.25}}}},
-          offers:[{{id:'o1',title:'Weekday Lunch Thali @ ₹149',status:'active'}}],
-          signals:['ctr_below_peer_median'],conversation_history:[]}}}})}})
-    merchantLoaded = true;
+      body: JSON.stringify({{
+        scope:'merchant', context_id: MERCHANT_ID, version:1,
+        delivered_at: new Date().toISOString(),
+        payload:{{
+          merchant_id: MERCHANT_ID,
+          category_slug:'dentists',
+          identity:{{
+            name:"Dr. Meera's Dental Clinic",
+            city:'Delhi', locality:'Lajpat Nagar',
+            verified:true, languages:['en','hi'],
+            owner_first_name:'Meera', established_year:2018
+          }},
+          subscription:{{status:'active', plan:'Pro', days_remaining:82}},
+          performance:{{
+            window_days:30, views:2410, calls:18, ctr:0.021,
+            delta_7d:{{views_pct:0.18, calls_pct:-0.05}}
+          }},
+          offers:[
+            {{id:'o_meera_001',title:'Dental Cleaning @ \u20b9299',status:'active',started:'2026-03-01'}},
+            {{id:'o_meera_002',title:'Deep Cleaning @ \u20b9499',status:'expired'}}
+          ],
+          customer_aggregate:{{
+            total_unique_ytd:540, lapsed_180d_plus:78,
+            retention_6mo_pct:0.38, high_risk_adult_count:124
+          }},
+          signals:['stale_posts:22d','ctr_below_peer_median','high_risk_adult_cohort'],
+          conversation_history:[],
+          review_themes:[
+            {{theme:'wait_time',sentiment:'neg',occurrences_30d:3,common_quote:'had to wait 30 min on Sunday'}},
+            {{theme:'doctor_manner',sentiment:'pos',occurrences_30d:5,common_quote:'Dr. Meera explains everything patiently'}}
+          ]
+        }}
+      }})
+    }})
   }}
   loadDemo();
 
@@ -233,18 +282,20 @@ async def homepage():
     try {{
       const res = await fetch(BOT+'/v1/reply', {{method:'POST',
         headers:{{'Content-Type':'application/json'}},
-        body: JSON.stringify({{conversation_id:convId,merchant_id:'demo_merchant',
-          from_role:'merchant',message:msg,received_at:new Date().toISOString(),turn_number:2}})}});
+        body: JSON.stringify({{
+          conversation_id: convId,
+          merchant_id: MERCHANT_ID,
+          from_role:'merchant', message:msg,
+          received_at:new Date().toISOString(), turn_number:2
+        }})}});
       const data = await res.json();
       document.querySelector('.msg.vera:last-child').remove();
       if (data.action==='send') addMsg(data.body || 'Got it!', 'vera');
-      else if (data.action==='end') addMsg('Conversation ended. Refresh to start again.', 'vera');
-      else addMsg('Taking a moment to think — try again shortly.', 'vera');
-    }} catch(e) {{ document.querySelector('.msg.vera:last-child').remove(); addMsg('Error connecting to bot.', 'vera'); }}
+      else if (data.action==='end') addMsg('\ud83d\udeab Conversation ended. Refresh to start again.', 'vera');
+      else addMsg('Backing off for now — reply later or refresh.', 'vera');
+    }} catch(e) {{ document.querySelector('.msg.vera:last-child').remove(); addMsg('Connection error. Try again.', 'vera'); }}
   }}
 </script>
-</body>
-</html>
 """)
 
 
