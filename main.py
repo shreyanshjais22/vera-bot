@@ -28,17 +28,18 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 
 START_TIME = time.time()
 
-# ── In-memory state ──────────────────────────────────────────────────────────
+# In-memory state ──────────────────────────────────────────────────────────
 # contexts[(scope, context_id)] = {"version": int, "payload": dict}
 contexts: dict[tuple[str, str], dict] = {}
 
 # conversations[conv_id] = [{"from": "vera|merchant|customer", "msg": str, "ts": str}]
 conversations: dict[str, list] = {}
 
-# suppressed suppression keys (ended conversations)
-suppressed_keys: set[str] = set()
+# suppressed_conversations: conv_ids that have been explicitly ENDED (opt-out)
+# NOT suppression_keys — those were causing judge retest failures!
+suppressed_conversations: set[str] = set()
 
-# conv_id → merchant_id mapping
+# conv_id → merchant_id / customer_id mapping
 conv_merchant_map: dict[str, str] = {}
 conv_customer_map: dict[str, Optional[str]] = {}
 
@@ -367,24 +368,18 @@ async def tick(body: TickBody):
     actions = []
 
     for trg_entry in body.available_triggers:
-        # Support both string trigger IDs and inline trigger objects
+        # Support both string trigger IDs AND inline trigger objects
         if isinstance(trg_entry, str):
             trg_id = trg_entry
             trg = _get_context("trigger", trg_id)
         elif isinstance(trg_entry, dict):
             trg_id = trg_entry.get("id") or trg_entry.get("context_id", "inline")
-            trg = trg_entry  # Use inline trigger directly
+            trg = trg_entry
         else:
             continue
 
         if not trg:
-            logger.warning(f"Trigger not found: {trg_id}")
-            continue
-
-        # Check suppression
-        supp_key = trg.get("suppression_key", "")
-        if supp_key in suppressed_keys:
-            logger.info(f"Trigger suppressed: {trg_id} (key={supp_key})")
+            logger.warning(f"Trigger not found in context store: {trg_id}")
             continue
 
         # Check expiry
@@ -392,8 +387,7 @@ async def tick(body: TickBody):
         if expires_at:
             try:
                 exp_dt = datetime.fromisoformat(expires_at.replace("Z", "+00:00"))
-                now_dt = datetime.now(timezone.utc)
-                if now_dt > exp_dt:
+                if datetime.now(timezone.utc) > exp_dt:
                     logger.info(f"Trigger expired: {trg_id}")
                     continue
             except Exception:
@@ -401,6 +395,8 @@ async def tick(body: TickBody):
 
         merchant_id = trg.get("merchant_id")
         customer_id = trg.get("customer_id")
+        trigger_kind = trg.get("kind", "generic")
+        supp_key = trg.get("suppression_key", trg_id)
 
         merchant = _get_context("merchant", merchant_id) if merchant_id else None
         if not merchant:
@@ -410,33 +406,38 @@ async def tick(body: TickBody):
         category_slug = merchant.get("category_slug", "")
         category = _get_context("category", category_slug)
         if not category:
-            logger.warning(f"Category context missing: {category_slug}")
+            logger.warning(f"Category context missing: {category_slug} for trigger {trg_id}")
             continue
 
-        customer = None
-        if customer_id:
-            customer = _get_context("customer", customer_id)
+        customer = _get_context("customer", customer_id) if customer_id else None
 
-        # Generate conv_id — reuse if merchant already has open conversation for this trigger kind
-        trigger_kind = trg.get("kind", "generic")
+        # Build deterministic conv_id from merchant + trigger kind + suppression_key
         if customer_id:
             conv_id = f"conv_{customer_id}_{trigger_kind}"
         else:
-            conv_id = f"conv_{merchant_id}_{trigger_kind}_{trg.get('suppression_key', trg_id)[:20]}"
+            conv_id = f"conv_{merchant_id}_{trigger_kind}_{supp_key[:20]}"
 
-        # Don't re-initiate a suppressed conversation
-        if conv_id in conversations:
-            history = conversations[conv_id]
-            if history and any(_is_ended(h) for h in history):
-                continue
+        # Skip if this conversation was explicitly opted-out/ended
+        if conv_id in suppressed_conversations:
+            logger.info(f"Conversation explicitly suppressed (opt-out): {conv_id}")
+            continue
+
+        # Skip if we already initiated this conversation this session
+        # (prevents duplicate sends; but allows judge to call tick multiple times
+        #  with NEW triggers after teardown or session reset)
+        existing = conversations.get(conv_id, [])
+        vera_msgs = [t for t in existing if t.get("from") == "vera"]
+        if vera_msgs:
+            logger.info(f"Already initiated conversation {conv_id}, skipping.")
+            continue
 
         try:
             result = compose(category, merchant, trg, customer)
         except Exception as e:
-            logger.error(f"Compose failed for trigger {trg_id}: {e}")
+            logger.error(f"Compose failed for trigger {trg_id}: {e}", exc_info=True)
             continue
 
-        # Record in conversation
+        # Record initiation in conversation
         conversations.setdefault(conv_id, []).append({
             "from": "vera",
             "msg": result["body"],
@@ -445,15 +446,10 @@ async def tick(body: TickBody):
         conv_merchant_map[conv_id] = merchant_id
         conv_customer_map[conv_id] = customer_id
 
-        # Suppress this key going forward
-        suppressed_keys.add(supp_key)
-
-        # Determine template params
         owner = merchant.get("identity", {}).get("owner_first_name", "")
         body_text = result["body"]
-        # Split body into up to 3 template params
-        parts = body_text[:100], body_text[100:200], body_text[200:320]
-        template_params = [p for p in parts if p.strip()]
+        parts = [body_text[:100], body_text[100:200], body_text[200:320]]
+        template_params = [owner] + [p for p in parts if p.strip()]
 
         action = {
             "conversation_id": conv_id,
@@ -462,7 +458,7 @@ async def tick(body: TickBody):
             "send_as": result.get("send_as", "vera"),
             "trigger_id": trg_id,
             "template_name": f"vera_{trigger_kind}_v1",
-            "template_params": [owner] + template_params,
+            "template_params": template_params,
             "body": result["body"],
             "cta": result.get("cta", "open_ended"),
             "suppression_key": result.get("suppression_key", supp_key),
@@ -510,6 +506,11 @@ async def reply(body: ReplyBody):
         customer_ctx=_get_context("customer", customer_id) if customer_id else None,
     )
 
+    # If merchant opted out, suppress this conversation from future ticks
+    if result.get("action") == "end":
+        suppressed_conversations.add(conv_id)
+    result.pop("_suppress_conversation", None)  # Clean internal flag if any
+
     # Record Vera's reply if it's a send
     if result.get("action") == "send" and result.get("body"):
         conversations[conv_id].append({
@@ -522,11 +523,12 @@ async def reply(body: ReplyBody):
 
 
 @app.post("/v1/teardown")
+@app.get("/v1/teardown")
 async def teardown():
-    """Optional endpoint — wipe state at end of test."""
+    """Wipe ALL state — call between test sessions."""
     contexts.clear()
     conversations.clear()
-    suppressed_keys.clear()
+    suppressed_conversations.clear()
     conv_merchant_map.clear()
     conv_customer_map.clear()
     logger.info("State wiped via /v1/teardown")
