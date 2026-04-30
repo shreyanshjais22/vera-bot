@@ -74,7 +74,7 @@ class CtxBody(BaseModel):
 
 class TickBody(BaseModel):
     now: str
-    available_triggers: list[str] = []
+    available_triggers: list[Any] = []  # list of trigger IDs (str) or inline trigger objects
 
 
 class ReplyBody(BaseModel):
@@ -366,8 +366,17 @@ async def push_context(body: CtxBody):
 async def tick(body: TickBody):
     actions = []
 
-    for trg_id in body.available_triggers:
-        trg = _get_context("trigger", trg_id)
+    for trg_entry in body.available_triggers:
+        # Support both string trigger IDs and inline trigger objects
+        if isinstance(trg_entry, str):
+            trg_id = trg_entry
+            trg = _get_context("trigger", trg_id)
+        elif isinstance(trg_entry, dict):
+            trg_id = trg_entry.get("id") or trg_entry.get("context_id", "inline")
+            trg = trg_entry  # Use inline trigger directly
+        else:
+            continue
+
         if not trg:
             logger.warning(f"Trigger not found: {trg_id}")
             continue
@@ -498,6 +507,7 @@ async def reply(body: ReplyBody):
         conversation_history=history,
         merchant_ctx=merchant_ctx,
         category_ctx=category_ctx,
+        customer_ctx=_get_context("customer", customer_id) if customer_id else None,
     )
 
     # Record Vera's reply if it's a send

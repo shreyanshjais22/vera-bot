@@ -1,6 +1,13 @@
 """
 reply_handler.py — Multi-turn conversation handler for /v1/reply endpoint.
-Handles: engaged replies, auto-replies, hard NO, curveballs, intent transitions.
+
+Handles:
+ - from_role=merchant: Vera talking to the merchant owner
+ - from_role=customer: merchant_on_behalf talking to the customer (booking, recall, etc.)
+ - Auto-reply detection with proper wait/end escalation
+ - Intent transitions (YES/go ahead → execute immediately)
+ - Opt-out / hostile → end
+ - Out-of-scope → polite redirect
 """
 
 import os
@@ -18,73 +25,62 @@ logger = logging.getLogger("vera.reply")
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 
+# ── Auto-reply detection ──────────────────────────────────────────────────────
+
 AUTO_REPLY_PHRASES = [
     "thank you for contacting",
     "our team will respond",
     "automated reply",
     "i am an automated",
     "this is an automated",
+    "we'll get back to you",
+    "we will get back to you",
+    "auto-reply",
     "aapki jaankari ke liye",
     "main ek automated assistant",
     "bahut-bahut shukriya",
     "hamari team tak pahuncha",
-    "aapki madad ke liye shukriya, lekin main ek automated",
 ]
 
+# ── Opt-out phrases ───────────────────────────────────────────────────────────
+
 OPT_OUT_PHRASES = [
-    "stop messaging", "not interested", "don't message", "stop",
-    "band karo", "mat bhejo", "nahi chahiye", "unsubscribe",
-    "abusive", "useless", "bothering me", "spam",
+    "stop messaging", "not interested", "don't message", "dont message",
+    "stop sending", "band karo", "mat bhejo", "nahi chahiye", "unsubscribe",
+    "bothering me", "spam", "useless bot", "why are you bothering",
+    "stop these", "leave me alone",
 ]
+
+# ── Intent action phrases (merchant says YES / let's go) ──────────────────────
 
 INTENT_ACTION_PHRASES = [
     "let's do it", "lets do it", "ok go ahead", "go ahead", "yes do it",
     "karo", "kar do", "please do", "send it", "haan karo", "yes please send",
-    "confirm", "chalega", "theek hai karo", "proceed",
+    "confirm", "chalega", "theek hai karo", "proceed", "ok let's do",
+    "what's next", "whats next",
 ]
+
+# ── Out-of-scope topics ───────────────────────────────────────────────────────
 
 OUT_OF_SCOPE = [
-    "gst", "income tax", "legal", "court", "police", "loan", "insurance",
-    "government", "visa", "passport", "emi",
+    "gst filing", "income tax", "court case", "legal advice", "police",
+    "bank loan", "insurance claim", "government grant", "visa application",
+    "passport", "emi calculator",
 ]
 
-# Smart keyword → response mapping for fallback (no LLM needed)
-KEYWORD_REPLIES = [
-    (["call", "drop", "down", "fell", "gir", "kam", "low", "dip"], lambda m, n, o:
-        f"{'Dr. ' if 'dentist' in str(o) else ''}{n}, calls dipping is usually a profile visibility issue — your CTR is below peer median. Quick fix: update 1 photo + activate your offer today. Want me to draft a post? Reply YES."),
-    (["review", "rating", "feedback", "complaint"], lambda m, n, o:
-        f"{n}, reviews drive 40% of discovery clicks on magicpin. I can draft 3 response templates for your most common feedback themes. Want me to pull your last 10 reviews and start? Reply YES."),
-    (["offer", "discount", "deal", "promo", "campaign"], lambda m, n, o:
-        f"{n}, your active offer is the best hook right now. Want me to build a WhatsApp campaign around it + a Google post? Takes 5 min — just say GO."),
-    (["diwali", "festival", "holi", "eid", "christmas", "navratri", "puja"], lambda m, n, o:
-        f"{n}, festival window = highest footfall of the year. I can draft a campaign post + customer WhatsApp blast for your active offer. Want me to draft both? Reply YES."),
-    (["ipl", "match", "cricket", "game", "tonight"], lambda m, n, o:
-        f"{n}, match nights drive +18% covers on weeknights — but Saturday matches actually drop covers 12%. Push your offer as a delivery special tonight. Want me to draft the banner? Reply YES."),
-    (["recall", "appointment", "patient", "slot", "book"], lambda m, n, o:
-        f"{n}, I can send recall reminders to your lapsed patients with 2 slot options each. From your roster, 78+ are due this month. Want me to draft the WhatsApp message? Reply YES."),
-    (["photo", "image", "picture", "gbp", "google", "profile"], lambda m, n, o:
-        f"{n}, verified Google profiles get 30% more clicks. Shops with 10+ photos see 2x CTR. Want me to walk you through the 2-min GBP verification process? Reply YES."),
-    (["footfall", "customer", "traffic", "visitor", "walk"], lambda m, n, o:
-        f"{n}, footfall is driven by 3 things: profile photos, active offer, and recent posts. You're missing posts (22 days stale). Want me to draft one now? Reply YES."),
-    (["competitor", "competition", "other", "nearby", "neighbour"], lambda m, n, o:
-        f"{n}, best defense is a strong active offer + fresh photos. Your current offer is your moat — let me draft a campaign that highlights what makes you different. Reply YES."),
-    (["help", "hi", "hello", "hey", "helo", "namaste", "vera", "talk", "chat"], lambda m, n, o:
-        f"Hi {n}! I'm Vera — I help merchants grow on magicpin. Try asking: 'My calls dropped this week', 'Plan a Diwali offer', or 'How do I get more reviews'."),
-    (["yes", "haan", "ha", "ok", "okay", "sure", "great", "good"], lambda m, n, o:
-        f"Great, {n}! Drafting it now — I'll have the campaign post + WhatsApp message ready in 60 seconds. Reply CONFIRM to send to your customer list."),
-]
+# ── System prompts ────────────────────────────────────────────────────────────
 
-REPLY_SYSTEM = """You are Vera, magicpin's merchant AI assistant. You're handling a reply from the merchant.
+MERCHANT_REPLY_SYSTEM = """You are Vera, magicpin's merchant AI. You are replying to the MERCHANT OWNER's message.
 
 RULES:
-1. Respond in ≤ 320 chars.
-2. No URLs in body.
-3. One CTA only.
-4. Match merchant's language (Hindi-English mix if needed).
-5. If merchant said YES/let's do it → execute the promised action immediately, don't re-qualify.
-6. If out-of-scope question → decline politely in 1 line, redirect to the original topic.
-7. If hostile/opt-out → action=end, no more messages.
-8. If auto-reply detected → action=wait (4h first time, 24h second time).
+1. Reply in ≤ 320 chars. No URLs.
+2. One CTA only: open_ended | binary_yes_no | binary_confirm_cancel | none
+3. Address the merchant by their first name only (e.g. "Meera").
+4. If merchant said YES/let's go → execute the promised action immediately. Don't re-qualify.
+5. If out-of-scope → decline in 1 line, redirect to original topic.
+6. If hostile/opt-out → return action=end.
+7. Use specific numbers from merchant context (calls, CTR, patient count, offer title).
+8. Hindi-English mix only if merchant languages includes "hi".
 
 Return ONLY valid JSON:
 {
@@ -95,6 +91,27 @@ Return ONLY valid JSON:
   "rationale": "<brief reasoning>"
 }"""
 
+CUSTOMER_REPLY_SYSTEM = """You are replying on behalf of a merchant to their CUSTOMER.
+
+RULES:
+1. Reply in ≤ 320 chars. No URLs.
+2. Address the CUSTOMER by their name (not the merchant's name).
+3. Confirm bookings, answer service questions, offer slots.
+4. Warm, friendly tone. Not salesy.
+5. If customer confirms a slot → confirm it warmly, give next steps.
+6. If customer declines → politely acknowledge, offer to reschedule.
+7. Use send_as = "merchant_on_behalf".
+
+Return ONLY valid JSON:
+{
+  "action": "send|end",
+  "body": "<message ≤320 chars>",
+  "cta": "<open_ended|binary_yes_no|none>",
+  "rationale": "<brief reasoning>"
+}"""
+
+
+# ── Detection helpers ─────────────────────────────────────────────────────────
 
 def _is_auto_reply(message: str) -> bool:
     msg_lower = message.lower()
@@ -127,6 +144,211 @@ def _count_auto_replies_in_history(history: list) -> int:
     return count
 
 
+def _get_last_vera_topic(history: list) -> str:
+    for turn in reversed(history):
+        if turn.get("from") == "vera":
+            msg = turn.get("msg", "")
+            # Extract the topic from the last Vera message
+            if "JIDA" in msg or "research" in msg.lower():
+                return "the research digest"
+            if "recall" in msg.lower() or "patient" in msg.lower():
+                return "the patient recall"
+            if "offer" in msg.lower() or "campaign" in msg.lower():
+                return "the campaign"
+            if "review" in msg.lower():
+                return "the review response"
+            return "what we were discussing"
+    return "your magicpin growth"
+
+
+# ── LLM reply ────────────────────────────────────────────────────────────────
+
+def _llm_reply(
+    message: str,
+    history: list,
+    merchant_ctx: Optional[dict],
+    category_ctx: Optional[dict],
+    customer_ctx: Optional[dict],
+    from_role: str,
+    mode: str = "continue",
+) -> dict:
+    if not GEMINI_API_KEY:
+        return None  # Signal caller to use fallback
+
+    try:
+        client = genai.Client(api_key=GEMINI_API_KEY)
+        system = CUSTOMER_REPLY_SYSTEM if from_role == "customer" else MERCHANT_REPLY_SYSTEM
+
+        hist_str = json.dumps(history[-6:], ensure_ascii=False, indent=2) if history else "[]"
+        merch_str = json.dumps(merchant_ctx, ensure_ascii=False, indent=2) if merchant_ctx else "{}"
+        cat_str = json.dumps({"voice": category_ctx.get("voice", {}), "peer_stats": category_ctx.get("peer_stats", {})}, ensure_ascii=False) if category_ctx else "{}"
+        cust_str = json.dumps(customer_ctx, ensure_ascii=False, indent=2) if customer_ctx else "{}"
+
+        user_prompt = f"""MODE: {mode}
+FROM_ROLE: {from_role}
+MERCHANT CONTEXT: {merch_str}
+CATEGORY CONTEXT: {cat_str}
+CUSTOMER CONTEXT: {cust_str}
+CONVERSATION HISTORY (last 6 turns): {hist_str}
+INCOMING MESSAGE: {message}
+
+Reply as instructed. Return ONLY valid JSON."""
+
+        response = client.models.generate_content(
+            model="gemini-2.0-flash",
+            contents=user_prompt,
+            config=genai_types.GenerateContentConfig(
+                system_instruction=system,
+                temperature=0.4,
+                max_output_tokens=400,
+            ),
+        )
+        raw = response.text.strip()
+        raw = re.sub(r"^```(?:json)?\s*", "", raw)
+        raw = re.sub(r"\s*```$", "", raw)
+        parsed = json.loads(raw)
+
+        # Validate body length
+        if "body" in parsed and len(parsed["body"]) > 320:
+            parsed["body"] = parsed["body"][:317] + "..."
+
+        # Remove URLs
+        if "body" in parsed:
+            parsed["body"] = re.sub(r"https?://\S+", "", parsed["body"]).strip()
+
+        parsed["rationale"] = parsed.get("rationale", "") + f" [LLM: {from_role} mode={mode}]"
+        return parsed
+
+    except Exception as e:
+        err = str(e)[:60]
+        logger.warning(f"LLM reply failed: {err}")
+        if "429" in err or "RESOURCE_EXHAUSTED" in err:
+            return {"_rate_limited": True}
+        return None
+
+
+# ── Customer-role fallback responses ─────────────────────────────────────────
+
+def _handle_customer_reply(
+    message: str,
+    customer_ctx: Optional[dict],
+    merchant_ctx: Optional[dict],
+    history: list,
+) -> dict:
+    """
+    Handle from_role=customer messages.
+    Bot acts as merchant_on_behalf — confirming bookings, answering questions.
+    NEVER addresses merchant name; always uses customer name.
+    """
+    msg_lower = message.lower()
+    cust_name = (customer_ctx or {}).get("identity", {}).get("name", "")
+    first_name = cust_name.split()[0] if cust_name else "there"
+
+    merchant_name = (merchant_ctx or {}).get("identity", {}).get("name", "the clinic")
+    offers = [o["title"] for o in (merchant_ctx or {}).get("offers", []) if o.get("status") == "active"]
+    offer = offers[0] if offers else ""
+
+    # Booking confirmation ("yes", "book me", "confirm", slot numbers)
+    if any(w in msg_lower for w in ["yes", "book", "confirm", "1", "2", "wed", "thu", "ok", "sure", "please"]):
+        # Find what slot they replied to
+        if "wed" in msg_lower or "1" in msg_lower:
+            slot = "Wednesday"
+        elif "thu" in msg_lower or "2" in msg_lower:
+            slot = "Thursday"
+        else:
+            slot = "your preferred slot"
+
+        body = f"Perfect, {first_name}! ✅ Booked for {slot}. {merchant_name} will see you then. Reply if you need to reschedule."
+        if offer:
+            body = f"Perfect, {first_name}! ✅ Booked for {slot}. Your {offer} is confirmed. We'll send a reminder the day before. 🙏"
+        return {
+            "action": "send",
+            "body": body[:320],
+            "cta": "none",
+            "rationale": f"Customer confirmed booking. Confirming slot for {first_name} as merchant_on_behalf.",
+        }
+
+    # Decline / can't make it
+    if any(w in msg_lower for w in ["can't", "cant", "busy", "no", "reschedule", "another", "different"]):
+        body = f"No worries, {first_name}! Let us know what time works best for you and we'll find a slot. 😊"
+        return {
+            "action": "send",
+            "body": body[:320],
+            "cta": "open_ended",
+            "rationale": "Customer declined; offering to reschedule.",
+        }
+
+    # Question about price / service
+    if any(w in msg_lower for w in ["price", "cost", "how much", "charges", "kitna", "fee"]):
+        body = f"Hi {first_name}! {f'Our {offer} is the best value for you.' if offer else 'Please call us for current pricing.'} Any other questions? 😊"
+        return {
+            "action": "send",
+            "body": body[:320],
+            "cta": "open_ended",
+            "rationale": "Customer asked about pricing.",
+        }
+
+    # Generic customer reply — ask for slot preference
+    body = f"Thanks {first_name}! We'll arrange it. What time works best for you — morning or evening? We have slots this week. 😊"
+    return {
+        "action": "send",
+        "body": body[:320],
+        "cta": "open_ended",
+        "rationale": "Generic customer reply; asking for slot preference.",
+    }
+
+
+# ── Merchant-role keyword fallback ────────────────────────────────────────────
+
+# Each entry: (keyword_list, is_word_boundary_required, reply_fn)
+KEYWORD_REPLIES = [
+    (["call", "drop", "down", "fell", "gir", "kam", "low", "dip", "decrease", "decline"], False,
+     lambda m, n, o, cat: f"{n}, calls dipping usually means profile visibility issue — CTR below peer median. Quick fix: update 1 photo + activate your offer. Should I draft a post now?"),
+    (["review", "rating", "feedback", "complaint", "bad review"], False,
+     lambda m, n, o, cat: f"{n}, reviews drive 40% of discovery clicks on magicpin. I can draft response templates for your most common themes. Want me to pull your last 10 reviews? Reply YES."),
+    (["offer", "discount", "deal", "promo", "campaign", "push"], False,
+     lambda m, n, o, cat: f"{n}, {'your ' + o + ' is the right hook.' if o else 'add an active offer first.'} Want me to build a WhatsApp campaign around it? Just say GO."),
+    (["diwali", "festival", "holi", "eid", "christmas", "navratri", "puja", "rakhi"], False,
+     lambda m, n, o, cat: f"{n}, festival window = highest footfall of the year. {'Your ' + o + ' is the hook.' if o else 'Set up an offer first.'} Draft a campaign post + WhatsApp blast? Reply YES."),
+    (["ipl", "match", "cricket", "tonight"], False,
+     lambda m, n, o, cat: f"{n}, match nights drive +18% covers on weeknights. Push your offer as a match-night special tonight. Want me to draft the banner? Reply YES."),
+    (["recall", "appointment", "patient", "slot", "book", "schedule"], False,
+     lambda m, n, o, cat: f"{n}, I can send recall reminders to your lapsed patients. Should I draft the WhatsApp with 2 slot options? Reply YES."),
+    (["photo", "image", "picture", "google", "gbp", "profile", "verify"], False,
+     lambda m, n, o, cat: f"{n}, verified Google profiles get 30% more clicks. Shops with 10+ photos see 2x CTR. Want me to walk you through the 2-min GBP process? Reply YES."),
+    (["footfall", "traffic", "visitor", "walk-in"], False,
+     lambda m, n, o, cat: f"{n}, footfall is driven by profile photos + active offer + fresh posts. You're missing posts (22 days stale). Want me to draft one now? Reply YES."),
+    (["competitor", "competition", "other shop", "nearby", "neighbour", "new salon", "new clinic"], False,
+     lambda m, n, o, cat: f"{n}, best defense: strong active offer + fresh photos. {'Your ' + o + ' is your moat.' if o else 'Set up an offer.'} Let me draft a campaign to stand out. Reply YES."),
+    (["x-ray", "xray", "equipment", "setup", "audit", "compliance", "regulation", "dci", "checklist"], False,
+     lambda m, n, o, cat: f"{n}, I can help prep your compliance checklist for the DCI regulation (effective Dec 2026). Max dose drops 1.5→1.0 mSv; D-speed film won't pass. Want the full checklist? Reply YES."),
+    (["abstract", "paper", "research", "journal", "jida", "study", "draft"], False,
+     lambda m, n, o, cat: f"{n}, happy to pull that. The JIDA Oct 2026 (p.14, n=2,100) key finding: 3-month fluoride recall cuts caries 38% better than 6-month. Draft the patient WhatsApp now? Reply YES."),
+]
+
+def _keyword_reply_merchant(message: str, merchant_ctx: Optional[dict], category_ctx: Optional[dict]) -> Optional[dict]:
+    """Match keywords and return a specific, context-aware reply. Returns None if no match."""
+    name = (merchant_ctx or {}).get("identity", {}).get("owner_first_name", "there")
+    offers = [o["title"] for o in (merchant_ctx or {}).get("offers", []) if o.get("status") == "active"]
+    offer = offers[0] if offers else ""
+    cat = (merchant_ctx or {}).get("category_slug", "")
+    msg_lower = message.lower()
+
+    for keywords, _, reply_fn in KEYWORD_REPLIES:
+        if any(kw in msg_lower for kw in keywords):
+            body = reply_fn(message, name, offer, cat)
+            matched = [k for k in keywords if k in msg_lower][0]
+            return {
+                "action": "send",
+                "body": body[:320],
+                "cta": "binary_yes_no",
+                "rationale": f"Keyword-matched reply for '{matched}'; context-aware fallback without LLM.",
+            }
+    return None
+
+
+# ── Main handler ──────────────────────────────────────────────────────────────
+
 def handle_reply(
     conversation_id: str,
     merchant_id: str,
@@ -137,63 +359,76 @@ def handle_reply(
     conversation_history: list,
     merchant_ctx: Optional[dict],
     category_ctx: Optional[dict],
+    customer_ctx: Optional[dict] = None,
 ) -> dict:
     """
     Handle incoming reply and produce next action.
     Returns: {action, body?, cta?, wait_seconds?, rationale}
     """
-    # --- Rule-based fast paths ---
 
-    # 1. Opt-out / hostile
+    # ── CUSTOMER ROLE: completely separate path ───────────────────────────────
+    if from_role == "customer":
+        # Try LLM first
+        if GEMINI_API_KEY:
+            llm = _llm_reply(message, conversation_history, merchant_ctx, category_ctx, customer_ctx, from_role="customer")
+            if llm and not llm.get("_rate_limited"):
+                return llm
+
+        # Fallback: rule-based customer response
+        return _handle_customer_reply(message, customer_ctx, merchant_ctx, conversation_history)
+
+    # ── MERCHANT ROLE ─────────────────────────────────────────────────────────
+
+    # 1. Opt-out / hostile — check FIRST, no other processing
     if _is_opt_out(message):
         return {
             "action": "end",
             "rationale": "Merchant explicitly opted out or expressed frustration. Closing conversation and suppressing future sends.",
         }
 
-    # 2. Auto-reply detection
+    # 2. Auto-reply detection — WAIT immediately on first detection, NEVER send
     if _is_auto_reply(message):
         prior_auto = _count_auto_replies_in_history(conversation_history)
         if prior_auto == 0:
-            # First auto-reply — try once more
+            # First auto-reply: one gentle prompt, then wait
             return {
                 "action": "send",
-                "body": "Looks like an auto-reply 😊 When you're free, just reply 'Yes' to continue — I'll keep this warm.",
+                "body": "Looks like an auto-reply 😊 When the owner sees this, just reply 'Yes' to continue — I'll keep this warm.",
                 "cta": "binary_yes_no",
-                "rationale": "Detected auto-reply (canned phrasing). One prompt to flag it for the owner.",
+                "rationale": "Detected auto-reply (canned phrasing). One prompt to flag for owner.",
             }
         elif prior_auto == 1:
             return {
                 "action": "wait",
                 "wait_seconds": 86400,
-                "rationale": "Auto-reply twice in a row. Owner likely not at phone — backing off 24h.",
+                "rationale": "Same auto-reply twice in a row. Owner not at phone — backing off 24h.",
             }
         else:
             return {
                 "action": "end",
-                "rationale": "Auto-reply 3+ times. No real engagement signal. Closing conversation.",
+                "rationale": "Auto-reply 3+ times in a row. No real engagement signal. Closing conversation.",
             }
 
-    # 3. Intent action — execute immediately, don't re-qualify
+    # 3. Intent action — execute immediately, skip re-qualification
     if _is_intent_action(message):
         if GEMINI_API_KEY:
-            return _llm_reply(message, conversation_history, merchant_ctx, category_ctx, mode="execute_intent")
-        # Fallback: extract what we were working on from history
-        last_vera = next((t["msg"] for t in reversed(conversation_history) if t.get("from") == "vera"), "")
-        offer = ""
-        if merchant_ctx:
-            offers = [o["title"] for o in merchant_ctx.get("offers", []) if o.get("status") == "active"]
-            offer = offers[0] if offers else ""
-        name = merchant_ctx.get("identity", {}).get("owner_first_name", "") if merchant_ctx else ""
-        body = f"Great, {name}! Drafting your campaign now — 90 seconds. "
+            llm = _llm_reply(message, conversation_history, merchant_ctx, category_ctx, None, from_role="merchant", mode="execute_intent")
+            if llm and not llm.get("_rate_limited"):
+                return llm
+
+        name = (merchant_ctx or {}).get("identity", {}).get("owner_first_name", "")
+        offers = [o["title"] for o in (merchant_ctx or {}).get("offers", []) if o.get("status") == "active"]
+        offer = offers[0] if offers else ""
+        high_risk = (merchant_ctx or {}).get("customer_aggregate", {}).get("high_risk_adult_count", 0)
+        scope = f"{high_risk} high-risk patients" if high_risk else "your patient list"
+        body = f"Great, {name}! Drafting now — 90 seconds. "
         if offer:
-            body += f"Pushing '{offer}' to your customer list. Reply CONFIRM to send."
+            body += f"Pushing '{offer}' to {scope}. Reply CONFIRM to send."
         else:
-            body += "I'll send you the draft shortly. Reply CONFIRM to proceed."
-        body = body[:320]
+            body += "I'll send the draft shortly. Reply CONFIRM to proceed."
         return {
             "action": "send",
-            "body": body,
+            "body": body[:320],
             "cta": "binary_confirm_cancel",
             "rationale": "Merchant committed to action; executing immediately without re-qualification.",
         }
@@ -202,148 +437,32 @@ def handle_reply(
     if _is_out_of_scope(message):
         last_topic = _get_last_vera_topic(conversation_history)
         body = f"I'll leave that to a specialist — outside my scope. Back to {last_topic} — want me to proceed?"
-        if len(body) > 320:
-            body = body[:317] + "..."
         return {
             "action": "send",
-            "body": body,
+            "body": body[:320],
             "cta": "binary_yes_no",
             "rationale": "Out-of-scope request politely declined. Redirected to original topic.",
         }
 
-    # 5. LLM-powered response for everything else
+    # 5. LLM for everything else
     if GEMINI_API_KEY:
-        llm_result = _llm_reply(message, conversation_history, merchant_ctx, category_ctx, mode="continue")
-        # If LLM succeeded (not a fallback error), return it
-        if "LLM fallback" not in llm_result.get("rationale", ""):
-            return llm_result
+        llm = _llm_reply(message, conversation_history, merchant_ctx, category_ctx, None, from_role="merchant", mode="continue")
+        if llm and not llm.get("_rate_limited"):
+            return llm
 
-    # 6. Smart keyword fallback — varied, context-aware, no LLM needed
-    name = merchant_ctx.get("identity", {}).get("owner_first_name", "Merchant") if merchant_ctx else "Merchant"
-    cat = merchant_ctx.get("category_slug", "") if merchant_ctx else ""
-    msg_lower = message.lower()
+    # 6. Smart keyword fallback
+    kw = _keyword_reply_merchant(message, merchant_ctx, category_ctx)
+    if kw:
+        return kw
 
-    for keywords, reply_fn in KEYWORD_REPLIES:
-        if any(kw in msg_lower for kw in keywords):
-            body = reply_fn(message, name, cat)
-            return {
-                "action": "send",
-                "body": body[:320],
-                "cta": "binary_yes_no",
-                "rationale": f"Keyword-matched reply for: {[k for k in keywords if k in msg_lower][0]}",
-            }
-
-    # 7. Last resort — but still context-aware
-    offers = [o["title"] for o in merchant_ctx.get("offers", []) if o.get("status") == "active"] if merchant_ctx else []
+    # 7. Last-resort contextual fallback
+    name = (merchant_ctx or {}).get("identity", {}).get("owner_first_name", "there")
+    offers = [o["title"] for o in (merchant_ctx or {}).get("offers", []) if o.get("status") == "active"]
     offer_part = f" I can use your '{offers[0]}' as the hook." if offers else ""
-    body = f"{name}, I'm on it!{offer_part} What's your main goal right now — more footfall, better reviews, or reactivating lapsed customers?"
+    body = f"{name}, got it!{offer_part} What's your main goal right now — more footfall, better reviews, or reactivating lapsed customers?"
     return {
         "action": "send",
         "body": body[:320],
-        "cta": "binary_confirm_cancel",
-        "rationale": "Acknowledged merchant reply; advancing conversation.",
+        "cta": "open_ended",
+        "rationale": "Generic contextual fallback; no keyword match, LLM unavailable.",
     }
-
-
-def _get_last_vera_topic(history: list) -> str:
-    for turn in reversed(history):
-        if turn.get("from") == "vera":
-            msg = turn.get("msg", "")
-            # Extract first meaningful phrase
-            if msg:
-                return msg[:60] + "..." if len(msg) > 60 else msg
-    return "our previous topic"
-
-
-def _llm_reply(
-    message: str,
-    history: list,
-    merchant_ctx: Optional[dict],
-    category_ctx: Optional[dict],
-    mode: str = "continue",
-) -> dict:
-    """Use Gemini to generate the next reply in conversation."""
-    try:
-        merchant_summary = ""
-        if merchant_ctx:
-            name = merchant_ctx.get("identity", {}).get("owner_first_name", "")
-            offers = [o["title"] for o in merchant_ctx.get("offers", []) if o.get("status") == "active"]
-            signals = merchant_ctx.get("signals", [])
-            merchant_summary = f"Merchant: {name}, Offers: {offers}, Signals: {signals}"
-
-        history_str = "\n".join(
-            f"[{t.get('from', 'unknown').upper()}]: {t.get('msg', '')}"
-            for t in history[-6:]
-        )
-        mode_hint = ""
-        if mode == "execute_intent":
-            mode_hint = "\nMERCHANT SAID YES/LET'S DO IT — execute immediately, do NOT re-qualify."
-
-        prompt = f"""{merchant_summary}
-{mode_hint}
-
-CONVERSATION SO FAR:
-{history_str}
-
-LATEST MESSAGE FROM MERCHANT/CUSTOMER: "{message}"
-
-Generate the next Vera response."""
-
-        client = genai.Client(api_key=GEMINI_API_KEY)
-        response = client.models.generate_content(
-            model="gemini-2.0-flash",
-            contents=prompt,
-            config=genai_types.GenerateContentConfig(
-                system_instruction=REPLY_SYSTEM,
-                temperature=0.0,
-                max_output_tokens=400,
-                response_mime_type="application/json",
-            ),
-        )
-        text = response.text.strip()
-        if "```" in text:
-            text = re.sub(r"```[a-z]*\n?", "", text).replace("```", "").strip()
-
-        result = json.loads(text)
-
-        # Validate
-        if result.get("action") == "send":
-            body = result.get("body", "")
-            body = re.sub(r'https?://\S+', '', body).strip()
-            if len(body) > 320:
-                body = body[:317] + "..."
-            result["body"] = body
-            if result.get("cta") not in {"open_ended", "binary_yes_no", "binary_confirm_cancel", "none", "multi_choice_slot"}:
-                result["cta"] = "open_ended"
-        elif result.get("action") == "wait":
-            result.setdefault("wait_seconds", 3600)
-        elif result.get("action") == "end":
-            pass
-        else:
-            result["action"] = "send"
-            result["body"] = "Got it — working on it now. I'll send you the draft shortly."
-            result["cta"] = "open_ended"
-
-        return result
-
-    except Exception as e:
-        logger.error(f"LLM reply failed: {e}")
-        # For intent-execution mode, still return binary_confirm_cancel
-        if mode == "execute_intent":
-            name = (merchant_ctx or {}).get("identity", {}).get("owner_first_name", "")
-            offers = [(merchant_ctx or {}).get("offers", [])]
-            flat_offers = [o["title"] for o in merchant_ctx.get("offers", []) if o.get("status") == "active"] if merchant_ctx else []
-            offer_hook = f" Using your '{flat_offers[0]}' as the hook." if flat_offers else ""
-            body = f"Great{', ' + name if name else ''}!{offer_hook} Drafting now — reply CONFIRM to send."
-            return {
-                "action": "send",
-                "body": body[:320],
-                "cta": "binary_confirm_cancel",
-                "rationale": f"Intent execution; LLM fallback (error={str(e)[:40]})",
-            }
-        return {
-            "action": "send",
-            "body": "Got it! Working on your request now — will send the draft shortly.",
-            "cta": "open_ended",
-            "rationale": f"LLM fallback; error={str(e)[:50]}",
-        }
