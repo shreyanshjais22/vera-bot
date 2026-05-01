@@ -113,45 +113,88 @@ def _build_prompt(category: dict, merchant: dict, trigger: dict, customer: Optio
     category_slug = merchant.get("category_slug", category.get("slug", ""))
     trigger_kind = trigger.get("kind", "default")
     hint = _get_trigger_hint(trigger_kind)
+    payload = trigger.get("payload", {})
 
-    customer_block = ""
-    if customer:
-        customer_block = f"\n\nCUSTOMER CONTEXT:\n{json.dumps(customer, ensure_ascii=False, indent=2)}"
+    # ── Pre-analyze context to extract the best specifics ──────────────────────
+    perf = merchant.get("performance", {})
+    delta = perf.get("delta_7d", {})
+    offers = [o for o in merchant.get("offers", []) if o.get("status") == "active"]
+    offer_title = offers[0]["title"] if offers else None
+    peer_stats = category.get("peer_stats", {})
+    cust_agg = merchant.get("customer_aggregate", {})
+    signals = merchant.get("signals", [])
+    locality = merchant.get("identity", {}).get("locality", "")
+    city = merchant.get("identity", {}).get("city", "")
+    langs = merchant.get("identity", {}).get("languages", ["en"])
 
-    # Pull active digest item if trigger references one
-    digest_item = ""
-    top_item_id = trigger.get("payload", {}).get("top_item_id")
+    # Peer comparison
+    my_ctr = perf.get("ctr", 0)
+    peer_ctr = peer_stats.get("avg_ctr", 0)
+    peer_calls = peer_stats.get("avg_calls_30d", 0)
+    my_calls = perf.get("calls", 0)
+    ctr_gap = f"CTR {my_ctr*100:.1f}% vs peer {peer_ctr*100:.1f}%" if my_ctr and peer_ctr else ""
+    calls_gap = f"calls {my_calls} vs peer avg {peer_calls}" if my_calls and peer_calls else ""
+
+    # Extract digest item
+    digest_item = {}
+    top_item_id = payload.get("top_item_id")
     if top_item_id:
         for d in category.get("digest", []):
             if d.get("id") == top_item_id:
-                digest_item = f"\n\nRELEVANT DIGEST ITEM: {json.dumps(d, ensure_ascii=False)}"
+                digest_item = d
                 break
+    if not digest_item and category.get("digest"):
+        digest_item = category["digest"][0]
+
+    # Trend signals
+    trends = category.get("trend_signals", [])
+    trend_str = ""
+    if trends:
+        t = trends[0]
+        trend_str = f"'{t.get('query')}' search up {int(t.get('delta_yoy',0)*100)}% YoY in {city}"
+
+    # Customer details
+    cust_name = (customer or {}).get("identity", {}).get("name", "")
+    cust_langs = (customer or {}).get("identity", {}).get("languages", langs)
+    cust_slots = payload.get("available_slots", [])
+    slot_str = " or ".join(s["label"] for s in cust_slots[:2]) if cust_slots else ""
+
+    # Build BEST_SIGNALS block — this is the key to high specificity
+    signals_block = f"""
+PRE-ANALYZED BEST SIGNALS (use these directly in your message):
+- Merchant: {merchant_name}, {locality}, {city}
+- Active offer: {offer_title or 'NONE — mention they need one'}
+- Performance gap: {ctr_gap} | {calls_gap}
+- 7-day delta: calls {int(delta.get('calls_pct',0)*100):+d}%, views {int(delta.get('views_pct',0)*100):+d}%
+- Lapsed patients/customers: {cust_agg.get('lapsed_180d_plus', 0)} (6mo+)
+- High-risk cohort: {cust_agg.get('high_risk_adult_count', 0)}
+- Retention: {int(cust_agg.get('retention_6mo_pct',0)*100)}% vs peer {int(peer_stats.get('retention_6mo_pct',0)*100)}%
+- Key merchant signals: {', '.join(signals[:4]) if signals else 'none'}
+- Local trend: {trend_str}
+- Digest/research: {json.dumps(digest_item, ensure_ascii=False) if digest_item else 'none'}
+- Customer: {cust_name or 'N/A'} | Slots: {slot_str or 'N/A'}
+- Trigger payload: {json.dumps(payload, ensure_ascii=False)}
+- Hindi code-mix: {'YES — mix naturally' if 'hi' in langs else 'NO — English only'}
+- suppression_key to use: {trigger.get('suppression_key', '')}"""
+
+    customer_block = ""
+    if customer:
+        customer_block = f"\n\nFULL CUSTOMER CONTEXT:\n{json.dumps(customer, ensure_ascii=False, indent=2)}"
 
     prompt = f"""TRIGGER KIND: {trigger_kind}
 COMPOSER HINT: {hint}
+{signals_block}
 
-CATEGORY CONTEXT (slug={category_slug}):
-Voice: {json.dumps(category.get('voice', {}), ensure_ascii=False)}
-Peer stats: {json.dumps(category.get('peer_stats', {}), ensure_ascii=False)}
-Active offers catalog: {json.dumps(category.get('offer_catalog', []), ensure_ascii=False)}
-Seasonal beats: {json.dumps(category.get('seasonal_beats', []), ensure_ascii=False)}{digest_item}
+FULL CATEGORY CONTEXT (slug={category_slug}):
+{json.dumps(category, ensure_ascii=False, indent=2)}
 
-MERCHANT CONTEXT (id={merchant.get('merchant_id', '')}):
-Owner: {merchant_name}
-Location: {merchant.get('identity', {}).get('locality', '')}, {merchant.get('identity', {}).get('city', '')}
-Languages: {merchant.get('identity', {}).get('languages', ['en'])}
-Subscription: {json.dumps(merchant.get('subscription', {}), ensure_ascii=False)}
-Performance (30d): {json.dumps(merchant.get('performance', {}), ensure_ascii=False)}
-Active offers: {json.dumps([o for o in merchant.get('offers', []) if o.get('status') == 'active'], ensure_ascii=False)}
-Customer aggregate: {json.dumps(merchant.get('customer_aggregate', {}), ensure_ascii=False)}
-Signals: {merchant.get('signals', [])}
-Last conversation: {json.dumps(merchant.get('conversation_history', [])[-3:] if merchant.get('conversation_history') else [], ensure_ascii=False)}
-Review themes: {json.dumps(merchant.get('review_themes', []), ensure_ascii=False)}
+FULL MERCHANT CONTEXT:
+{json.dumps(merchant, ensure_ascii=False, indent=2)}{customer_block}
 
-TRIGGER CONTEXT:
-{json.dumps(trigger, ensure_ascii=False, indent=2)}{customer_block}
+FULL TRIGGER:
+{json.dumps(trigger, ensure_ascii=False, indent=2)}
 
-NOW compose the best possible Vera message. Remember: no URLs, ≤320 chars body, use real numbers from context only. Return JSON only."""
+Write the best Vera message using the PRE-ANALYZED SIGNALS above. Every number you use MUST come from the context. Return ONLY valid JSON."""
 
     return prompt
 
@@ -205,8 +248,8 @@ def compose(
             contents=prompt,
             config=genai_types.GenerateContentConfig(
                 system_instruction=SYSTEM_PROMPT,
-                temperature=0.0,
-                max_output_tokens=512,
+                temperature=0.3,
+                max_output_tokens=600,
                 response_mime_type="application/json",
             ),
         )
