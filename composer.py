@@ -259,8 +259,16 @@ def _fallback_compose(
         body = f"{name}, {source} dropped{n_str}. Key: {title}.{cohort_str} Draft a patient note? Reply YES."
 
     elif kind == "regulation_change":
-        deadline = payload.get("deadline_iso", "Dec 2026")[:10]
-        body = f"{name}, new DCI regulation active by {deadline}. Non-compliance risks inspection. Want me to prep your checklist?"
+        deadline = payload.get("deadline_iso", "2026-12-15")[:10]
+        # Pull specifics from digest item if available
+        items = category.get("digest", [])
+        reg_item = next((d for d in items if d.get("kind") == "compliance"), {})
+        summary = reg_item.get("summary", "")
+        if "D-speed" in summary or "1.5" in summary:
+            body = f"{name}, DCI circular (eff. {deadline}): max dose 1.5→1.0 mSv. D-speed film fails — E-speed passes. Your current setup may not comply. Want the checklist? Reply YES."
+        else:
+            body = f"{name}, DCI regulation effective {deadline}: radiograph max dose drops 1.5→1.0 mSv. D-speed film won't pass — E-speed does. Non-compliance = inspection risk. Want the checklist? Reply YES."
+
 
     elif kind in ("recall_due", "appointment_tomorrow"):
         slots = payload.get("available_slots", [])

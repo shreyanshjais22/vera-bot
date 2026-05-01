@@ -48,8 +48,11 @@ OPT_OUT_PHRASES = [
     "stop messaging", "not interested", "don't message", "dont message",
     "stop sending", "band karo", "mat bhejo", "nahi chahiye", "unsubscribe",
     "bothering me", "spam", "useless bot", "why are you bothering",
-    "stop these", "leave me alone",
+    "stop these", "leave me alone", "do not contact", "remove me",
 ]
+
+# Exact single-word stop commands (common WhatsApp opt-out)
+STOP_WORDS = {"stop", "end", "quit", "cancel", "unsubscribe", "optout", "opt-out"}
 
 # ── Intent action phrases (merchant says YES / let's go) ──────────────────────
 
@@ -119,8 +122,12 @@ def _is_auto_reply(message: str) -> bool:
 
 
 def _is_opt_out(message: str) -> bool:
-    msg_lower = message.lower()
-    return any(phrase in msg_lower for phrase in OPT_OUT_PHRASES)
+    msg_stripped = message.strip().lower()
+    # Exact single-word stop commands (WhatsApp standard opt-out)
+    if msg_stripped in STOP_WORDS:
+        return True
+    # Phrase-based opt-out
+    return any(phrase in msg_stripped for phrase in OPT_OUT_PHRASES)
 
 
 def _is_intent_action(message: str) -> bool:
